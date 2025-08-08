@@ -8,9 +8,10 @@ import {
     useState,
 } from "react";
 import type { DragEvent as ReactDragEvent, ChangeEvent } from "react";
+import { apiAnalyze, apiHealth, apiStream, apiUpload, mapRoleToApi, type SseEvent, type RoleApi } from "@/lib/api";
 
 type Mode = "Analyze" | "Describe" | "Summarize" | "All";
-type Role = "Marketing" | "Product Owner";
+type Role = "Marketing" | "Product Owner" | "Custom";
 type ProgressStyle = "Bar" | "Spinner" | "Simple" | "None";
 
 type Step =
@@ -108,7 +109,7 @@ export default function DemoPage() {
     const [items, setItems] = useState<FileItem[]>([]);
     const [dragActive, setDragActive] = useState(false);
     const maxFileSizeBytes = 10 * 1024 * 1024; // 10MB
-    const acceptedMime = ["image/png", "image/jpeg", "image/webp", "application/pdf"];
+    const acceptedMime = ["image/png", "image/jpeg", "image/webp"]; // images only
 
     const addFiles = useCallback((files: FileList | File[]) => {
         const arr = Array.from(files);
@@ -157,6 +158,17 @@ export default function DemoPage() {
     const [showElapsed, setShowElapsed] = useState(true);
     const [debug, setDebug] = useState(false);
     const [configOpen, setConfigOpen] = useState(true);
+    const [demoMode, setDemoMode] = useState<boolean>(false);
+    const [jobId, setJobId] = useState<string | null>(null);
+    const [resultText, setResultText] = useState<string>("");
+    const [logs, setLogs] = useState<string[]>([]);
+
+    const log = useCallback((msg: string) => {
+        const ts = new Date().toLocaleTimeString();
+        setLogs((prev) => [...prev, `[${ts}] ${msg}`].slice(-500));
+        // eslint-disable-next-line no-console
+        console.log(`[UI] ${msg}`);
+    }, []);
 
     // Run/progress state
     const steps: Step[] = useMemo(
@@ -176,14 +188,11 @@ export default function DemoPage() {
         return Math.floor((Date.now() - startAt) / 1000);
     }, [startAt, percent]);
 
-    const tokensPerSecond = useMemo(() => {
-        if (!running) return 0;
-        // Simple simulated TPS
-        return Math.round(20 + Math.random() * 80);
-    }, [running, percent]);
+    const [tokensPerSecond, setTokensPerSecond] = useState<number>(0);
 
-    // Simulated run sequence according to IA
-    const run = useCallback(async () => {
+    // Simulated run sequence (fallback / demo mode)
+    const runSimulated = useCallback(async () => {
+        log("Starting simulated run");
         setRunning(true);
         setCanceled(false);
         setError(null);
@@ -191,6 +200,8 @@ export default function DemoPage() {
         setStartAt(Date.now());
         setActiveStepIndex(0);
         setPercent(0);
+        setTokensPerSecond(0);
+        setResultText("");
 
         const stepDurationsMs = [1200, 2500, 3500, 1000, 1500, 800];
         try {
@@ -204,6 +215,7 @@ export default function DemoPage() {
                         const id = setInterval(() => {
                             const p = Math.min(99, Math.floor(((Date.now() - start) / duration) * 100));
                             setPercent(p);
+                            setTokensPerSecond(Math.round(20 + Math.random() * 80));
                             if (Date.now() - start >= duration) {
                                 clearInterval(id);
                                 setPercent(100);
@@ -217,14 +229,108 @@ export default function DemoPage() {
             }
             if (!canceled) {
                 setDone(true);
+                setResultText("Demo mode result: High-level findings... (simulated)");
+                log("Simulated run completed");
             }
         } catch (e) {
             setError("Unexpected error");
+            log(`Simulated run error: ${String(e)}`);
         } finally {
             setRunning(false);
             setActiveStepIndex((idx) => (canceled ? -1 : idx));
         }
-    }, [steps, progressStyle, canceled]);
+    }, [steps, progressStyle, canceled, log]);
+
+    // Live run sequence via API with SSE; uses only role + first valid image
+    const runLive = useCallback(async () => {
+        log("Starting live run");
+        setRunning(true);
+        setCanceled(false);
+        setError(null);
+        setDone(false);
+        setStartAt(Date.now());
+        setActiveStepIndex(0);
+        setPercent(0);
+        setTokensPerSecond(0);
+        setResultText("");
+        setJobId(null);
+
+        try {
+            log("Health check...");
+            await apiHealth();
+            log("Health OK");
+
+            const first = validItems[0];
+            if (!first) throw new Error("No valid file");
+
+            log(`Uploading: ${first.file.name} (${first.file.type}, ${first.file.size} bytes)`);
+            const newJobId = await apiUpload(first.file);
+            setJobId(newJobId);
+            log(`Upload OK: jobId=${newJobId}`);
+
+            let analyzeStarted = false;
+            log("Opening SSE stream");
+            const close = apiStream(newJobId, (ev: SseEvent) => {
+                if (ev.type === "stage") {
+                    log(`SSE stage: ${ev.stage}`);
+                    if (ev.stage === "chunking") setActiveStepIndex(1);
+                    else if (ev.stage === "ocr") setActiveStepIndex(2);
+                    else if (ev.stage === "combining") setActiveStepIndex(3);
+                    else if (ev.stage === "analyzing") setActiveStepIndex(4);
+                } else if (ev.type === "progress") {
+                    log(`SSE progress: ${ev.current}/${ev.total}`);
+                    if (typeof ev.total === "number" && ev.total > 0) {
+                        const pct = Math.min(99, Math.floor((ev.current / ev.total) * 100));
+                        setPercent(pct);
+                    }
+                } else if (ev.type === "tokens") {
+                    log(`SSE tokens: ${ev.tokens}`);
+                    setTokensPerSecond(ev.tokens);
+                } else if (ev.type === "error") {
+                    setError(ev.error);
+                    log(`SSE error: ${ev.error}`);
+                } else if (ev.type === "done") {
+                    if (typeof ev.result === "string" && ev.result.length > 0) {
+                        setResultText(ev.result);
+                        setDone(true);
+                        setPercent(100);
+                        setRunning(false);
+                        log("SSE done with result (analysis finished)");
+                        close();
+                    } else if (!analyzeStarted) {
+                        analyzeStarted = true;
+                        const analyzeBody: { role?: RoleApi; prompt?: string } = {};
+                        if (role !== "Custom") analyzeBody.role = mapRoleToApi(role);
+                        const trimmedPrompt = prompt.trim();
+                        if (trimmedPrompt) analyzeBody.prompt = trimmedPrompt;
+                        log(
+                            `Trigger analyze${analyzeBody.role ? ` (role=${analyzeBody.role})` : ""}${analyzeBody.prompt ? " with prompt" : ""}`
+                        );
+                        apiAnalyze(newJobId, analyzeBody)
+                            .then(() => log("Analyze accepted (202)"))
+                            .catch((e) => {
+                                setError(String(e));
+                                log(`Analyze error: ${String(e)}`);
+                            });
+                    }
+                }
+            }, (err) => {
+                log(`SSE connection error: ${JSON.stringify(err instanceof Event ? { type: err.type } : err)}`);
+            });
+        } catch (e) {
+            setError(String(e));
+            log(`Live run error: ${String(e)}`);
+            setRunning(false);
+        }
+    }, [validItems, role, prompt, log]);
+
+    const run = useCallback(async () => {
+        if (demoMode) {
+            await runSimulated();
+        } else {
+            await runLive();
+        }
+    }, [demoMode, runSimulated, runLive]);
 
     const cancelRun = useCallback(() => {
         setCanceled(true);
@@ -239,13 +345,16 @@ export default function DemoPage() {
         setActiveStepIndex(-1);
         setPercent(0);
         setStartAt(null);
+        setTokensPerSecond(0);
+        setResultText("");
+        setJobId(null);
     }, []);
 
     // Exports (mocked)
     const exportText = useCallback(() => {
         const content = `Role: ${role}\nMode: ${mode}\nFiles: ${validItems
             .map((f) => f.file.name)
-            .join(", ")}\n\nSummary:\n- High-level findings...`;
+            .join(", ")}\nJob ID: ${jobId ?? "-"}\n\nResult:\n${resultText || "(no result)"}`;
         const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
@@ -253,10 +362,11 @@ export default function DemoPage() {
         a.download = "summary.txt";
         a.click();
         URL.revokeObjectURL(url);
-    }, [role, mode, validItems]);
+    }, [role, mode, validItems, jobId, resultText]);
 
     const exportJson = useCallback(() => {
         const payload = {
+            jobId,
             role,
             mode,
             prompt,
@@ -264,6 +374,7 @@ export default function DemoPage() {
             textModel,
             chunking: chunking ? { maxDim: chunkMaxDim, aspect: chunkAspect, overlap: chunkOverlap } : null,
             files: validItems.map((f) => ({ name: f.file.name, size: f.file.size })),
+            result: resultText || null,
         };
         const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
         const url = URL.createObjectURL(blob);
@@ -272,7 +383,7 @@ export default function DemoPage() {
         a.download = "analysis.json";
         a.click();
         URL.revokeObjectURL(url);
-    }, [role, mode, prompt, visionModel, textModel, chunking, chunkMaxDim, chunkAspect, chunkOverlap, validItems]);
+    }, [jobId, role, mode, prompt, visionModel, textModel, chunking, chunkMaxDim, chunkAspect, chunkOverlap, validItems, resultText]);
 
     const exportZip = useCallback(() => {
         // No real zip generation; produce a placeholder binary-like blob
@@ -411,7 +522,7 @@ export default function DemoPage() {
                                 </label>
                             </p>
                             <p className="m-0 text-xs text-[#a8b3c4]">
-                                Accepted: PNG, JPEG, WEBP, PDF. Max 10MB each.
+                                Accepted: PNG, JPEG, WEBP. Max 10MB each. Only the first image will be analyzed in demo.
                             </p>
                         </div>
                     </div>
@@ -481,7 +592,10 @@ export default function DemoPage() {
                             </button>
                         )}
 
-                        <div role="status" aria-live="polite" className="text-sm text-[#a8b3c4] ml-auto">
+                        <div role="status" aria-live="polite" className="text-sm text-[#a8b3c4] ml-auto flex items-center gap-2">
+                            <span className={`px-2 py-0.5 rounded-full border text-xs ${demoMode ? "border-white/10 bg-white/5" : "border-emerald-400/30 bg-emerald-400/10"}`}>
+                                {demoMode ? "Demo mode" : "Live API"}
+                            </span>
                             {statusText}
                         </div>
                     </div>
@@ -566,7 +680,24 @@ export default function DemoPage() {
                                 </button>
                             </div>
 
-                            <ResultsTabs items={validItems} role={role} />
+                            <ResultsTabs items={validItems} role={role} resultText={resultText} />
+
+                            {/* Logs panel */}
+                            <div className="grid gap-2">
+                                <div className="flex items-center justify-between">
+                                    <h3 className="m-0 text-sm text-[#c8d3e0]">Logs</h3>
+                                    <button
+                                        type="button"
+                                        onClick={() => setLogs([])}
+                                        className="text-xs px-2 py-1 rounded-full border border-white/10 bg-white/5 hover:border-white/20"
+                                    >
+                                        Clear
+                                    </button>
+                                </div>
+                                <pre className="text-xs whitespace-pre-wrap rounded-lg border border-white/10 bg-black/30 p-3 max-h-56 overflow-auto">
+                                    {logs.join("\n") || "(no logs)"}
+                                </pre>
+                            </div>
                         </div>
                     )}
                 </article>
@@ -605,7 +736,7 @@ export default function DemoPage() {
                     <fieldset className="mb-4">
                         <legend className="text-sm text-[#c8d3e0] mb-1">Role</legend>
                         <div className="inline-flex rounded-full border border-white/10 overflow-hidden">
-                            {["Marketing", "Product Owner"].map((r) => (
+                            {["Marketing", "Product Owner", "Custom"].map((r) => (
                                 <button
                                     type="button"
                                     key={r}
@@ -632,7 +763,7 @@ export default function DemoPage() {
                             placeholder="Optional guidance for the model..."
                             className="w-full rounded-lg border border-white/10 bg-white/[0.02] p-2 text-sm outline-none focus:border-[#6ae3ff]/40"
                         />
-                        <p className="m-0 mt-1 text-xs text-[#a8b3c4]">Keep it concise; context is derived from uploaded files.</p>
+                        <p className="m-0 mt-1 text-xs text-[#a8b3c4]">Optional. If provided, this prompt will be sent to the backend and can override the default prompt.</p>
                     </div>
 
                     {/* Models */}
@@ -759,22 +890,29 @@ export default function DemoPage() {
                         </label>
                     </fieldset>
 
+                    <div className="mb-4">
+                        <label className="flex items-center gap-2 text-sm">
+                            <input type="checkbox" checked={demoMode} onChange={(e) => setDemoMode(e.target.checked)} />
+                            Simple demo mode (ignores mode, prompt, model and chunking settings)
+                        </label>
+                    </div>
+
                     {debug && (
                         <pre className="text-xs whitespace-pre-wrap rounded-lg border border-white/10 bg-black/30 p-3 overflow-auto max-h-64">
-                            {JSON.stringify({ mode, role, prompt, visionModel, textModel, chunking, chunkMaxDim, chunkAspect, chunkOverlap, saveChunks, outputDir, progressStyle }, null, 2)}
+                            {JSON.stringify({ demoMode, mode, role, prompt, visionModel, textModel, chunking, chunkMaxDim, chunkAspect, chunkOverlap, saveChunks, outputDir, progressStyle, jobId, resultPreview: resultText?.slice(0, 80) }, null, 2)}
                         </pre>
                     )}
                 </aside>
             </section>
 
             <footer className="px-6 pb-14 text-center text-[#a8b3c4] text-sm">
-                UI only; no backend calls. Exports generate client-side files.
+                Live mode connects to the local API; demo mode simulates the flow and results.
             </footer>
         </main>
     );
 }
 
-function ResultsTabs({ items, role }: { items: FileItem[]; role: Role }) {
+function ResultsTabs({ items, role, resultText }: { items: FileItem[]; role: Role; resultText?: string }) {
     const [tab, setTab] = useState<"Summary" | "Analysis" | "Chunks">("Summary");
     const [selectedIdx, setSelectedIdx] = useState(0);
 
@@ -800,11 +938,15 @@ function ResultsTabs({ items, role }: { items: FileItem[]; role: Role }) {
             {tab === "Summary" && (
                 <div className="grid gap-2 text-sm text-[#c8d3e0]">
                     <p className="m-0 text-[#e7edf4]">Summary for role: {role}</p>
-                    <ul className="list-disc pl-5 m-0">
-                        <li>Key insights extracted from content...</li>
-                        <li>Opportunities and risks highlighted...</li>
-                        <li>Recommended next steps tailored to {role}...</li>
-                    </ul>
+                    {resultText ? (
+                        <pre className="m-0 whitespace-pre-wrap text-[#c8d3e0] bg-white/5 rounded-lg p-3 border border-white/10">{resultText}</pre>
+                    ) : (
+                        <ul className="list-disc pl-5 m-0">
+                            <li>Key insights extracted from content...</li>
+                            <li>Opportunities and risks highlighted...</li>
+                            <li>Recommended next steps tailored to {role}...</li>
+                        </ul>
+                    )}
                 </div>
             )}
 
