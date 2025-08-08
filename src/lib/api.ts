@@ -1,7 +1,8 @@
 export type SseEvent =
     | { type: "stage"; stage: string }
     | { type: "progress"; current: number; total: number; message?: string }
-    | { type: "tokens"; tokens: number }
+    // tokens event now supports fixed-cadence rate with optional total; keep tokens for compatibility
+    | { type: "tokens"; rate?: number; tokens?: number; total?: number }
     | { type: "message"; message: string }
     | { type: "error"; error: string }
     | { type: "done"; result?: string };

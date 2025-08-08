@@ -284,8 +284,10 @@ export default function DemoPage() {
                         setPercent(pct);
                     }
                 } else if (ev.type === "tokens") {
-                    log(`SSE tokens: ${ev.tokens}`);
-                    setTokensPerSecond(ev.tokens);
+                    const rate = typeof ev.rate === "number" ? ev.rate : (typeof ev.tokens === "number" ? ev.tokens : 0);
+                    const total = typeof ev.total === "number" ? ev.total : undefined;
+                    log(`SSE tokens: rate=${Math.round(rate)}${total !== undefined ? ` total=${total}` : ""}`);
+                    setTokensPerSecond(Math.round(rate));
                 } else if (ev.type === "error") {
                     setError(ev.error);
                     log(`SSE error: ${ev.error}`);
