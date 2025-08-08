@@ -8,7 +8,7 @@ import {
     useState,
 } from "react";
 import type { DragEvent as ReactDragEvent, ChangeEvent } from "react";
-import { apiAnalyze, apiHealth, apiStream, apiUpload, mapRoleToApi, type SseEvent, type RoleApi } from "@/lib/api";
+import { apiAnalyze, apiHealth, apiStream, apiUpload, mapRoleToApi, mapModeToApi, type SseEvent, type RoleApi } from "@/lib/api";
 
 type Mode = "Analyze" | "Describe" | "Summarize" | "All";
 type Role = "Marketing" | "Product Owner" | "Custom";
@@ -264,7 +264,7 @@ export default function DemoPage() {
             if (!first) throw new Error("No valid file");
 
             log(`Uploading: ${first.file.name} (${first.file.type}, ${first.file.size} bytes)`);
-            const newJobId = await apiUpload(first.file);
+            const newJobId = await apiUpload(first.file, mapModeToApi(mode));
             setJobId(newJobId);
             log(`Upload OK: jobId=${newJobId}`);
 
@@ -299,12 +299,19 @@ export default function DemoPage() {
                         close();
                     } else if (!analyzeStarted) {
                         analyzeStarted = true;
-                        const analyzeBody: { role?: RoleApi; prompt?: string } = {};
-                        if (role !== "Custom") analyzeBody.role = mapRoleToApi(role);
+                        const analyzeBody: { role?: RoleApi; prompt?: string; mode?: ReturnType<typeof mapModeToApi> } = {
+                            mode: mapModeToApi(mode),
+                        };
                         const trimmedPrompt = prompt.trim();
-                        if (trimmedPrompt) analyzeBody.prompt = trimmedPrompt;
+                        if (trimmedPrompt) {
+                            analyzeBody.prompt = trimmedPrompt;
+                        } else if (role !== "Custom") {
+                            analyzeBody.role = mapRoleToApi(role);
+                        } else {
+                            analyzeBody.role = "free";
+                        }
                         log(
-                            `Trigger analyze${analyzeBody.role ? ` (role=${analyzeBody.role})` : ""}${analyzeBody.prompt ? " with prompt" : ""}`
+                            `Trigger analyze (mode=${analyzeBody.mode})${analyzeBody.role ? ` role=${analyzeBody.role}` : ""}${analyzeBody.prompt ? " with prompt" : ""}`
                         );
                         apiAnalyze(newJobId, analyzeBody)
                             .then(() => log("Analyze accepted (202)"))

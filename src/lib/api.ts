@@ -6,7 +6,8 @@ export type SseEvent =
     | { type: "error"; error: string }
     | { type: "done"; result?: string };
 
-export type RoleApi = "marketing" | "po";
+export type RoleApi = "marketing" | "po" | "free";
+export type ModeApi = "analyze" | "describe" | "summarize" | "all";
 
 const BASE = (typeof process !== "undefined" && process.env.NEXT_PUBLIC_API_BASE) || "http://localhost:3001";
 
@@ -16,9 +17,10 @@ export async function apiHealth(): Promise<{ ok: boolean; gridChunking: string }
     return res.json();
 }
 
-export async function apiUpload(file: File): Promise<string> {
+export async function apiUpload(file: File, mode?: ModeApi): Promise<string> {
     const form = new FormData();
     form.append("image", file);
+    if (mode) form.append("mode", mode);
     const res = await fetch(`${BASE}/api/upload`, { method: "POST", body: form });
     if (!res.ok) throw new Error(`upload failed: ${res.status}`);
     const data = await res.json();
@@ -45,7 +47,10 @@ export function apiStream(
     return () => es.close();
 }
 
-export async function apiAnalyze(jobId: string, body: { role?: RoleApi; prompt?: string }): Promise<void> {
+export async function apiAnalyze(
+    jobId: string,
+    body: { role?: RoleApi; prompt?: string; mode?: ModeApi }
+): Promise<void> {
     const res = await fetch(`${BASE}/api/analyze`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -56,6 +61,19 @@ export async function apiAnalyze(jobId: string, body: { role?: RoleApi; prompt?:
 
 export function mapRoleToApi(role: "Marketing" | "Product Owner"): RoleApi {
     return role === "Marketing" ? "marketing" : "po";
+}
+
+export function mapModeToApi(mode: "Analyze" | "Describe" | "Summarize" | "All"): ModeApi {
+    switch (mode) {
+        case "Analyze":
+            return "analyze";
+        case "Describe":
+            return "describe";
+        case "Summarize":
+            return "summarize";
+        default:
+            return "all";
+    }
 }
 
 
